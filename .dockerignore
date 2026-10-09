@@ -1,0 +1,7 @@
+data/
+uploads/
+__pycache__/
+*.pyc
+.env
+.git
+SumatraPDF.exe

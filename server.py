@@ -7,12 +7,12 @@ Env variables (Render mein set karo):
   USERS (optional)         -> "rahul:pass1,amit:pass2"  (har restart par ye users ban jaate hain)
   DATA_DIR (optional)      -> persistent disk ka path, jaise /data
 """
-import os, time, uuid, sqlite3, hmac
+import os, re, time, uuid, sqlite3, hmac
 from datetime import timedelta
 
 from flask import Flask, request, session, redirect, jsonify, render_template_string, send_file, abort
 from werkzeug.security import generate_password_hash, check_password_hash
-from PIL import Image
+from PIL import Image, ImageOps
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.environ.get("DATA_DIR", os.path.join(BASE, "data"))
@@ -66,6 +66,10 @@ def init():
         copies INTEGER, color INTEGER, pages INTEGER, status TEXT, error TEXT,
         created REAL, claimed REAL, finished REAL, path TEXT);
     """)
+    try:
+        c.execute("ALTER TABLE jobs ADD COLUMN settings TEXT")
+    except sqlite3.OperationalError:
+        pass
     c.execute("""INSERT INTO users(username,pw,is_admin,created) VALUES(?,?,1,?)
                  ON CONFLICT(username) DO UPDATE SET pw=excluded.pw, is_admin=1""",
               (ADMIN_USER, generate_password_hash(ADMIN_PASS), time.time()))
@@ -106,6 +110,49 @@ def ahead_count(printer_id, created=None):
                    AND created<?""", (printer_id, created), one=True)
     return r["n"]
 
+
+PAPERS = {"A3": "A3", "A4": "A4", "A5": "A5", "letter": "letter", "legal": "legal"}
+ORIENTS = {"auto", "portrait", "landscape"}
+SCALES = {"shrink", "fit", "noscale"}
+SIDES = {"single": "simplex", "long": "duplexlong", "short": "duplexshort"}
+
+def parse_range(txt, n):
+    """'1-3,5' -> ('1-3,5-5', kitne pages). Khali = saare pages. Galat ho to ValueError."""
+    txt = (txt or "").replace(" ", "")
+    if not txt:
+        return "", n
+    pages, parts = set(), []
+    for tok in txt.split(","):
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", tok)
+        if not m:
+            raise ValueError
+        a = int(m.group(1))
+        b = int(m.group(2) or a)
+        if a < 1 or b < a or b > n:
+            raise ValueError
+        pages.update(range(a, b + 1))
+        parts.append(f"{a}-{b}")
+    return ",".join(parts), len(pages)
+
+def build_settings(copies, color, paper, orient, scale, sides, rng):
+    parts = [f"{copies}x", "color" if color else "monochrome", "paper=" + PAPERS[paper]]
+    if orient != "auto":
+        parts.append(orient)
+    parts.append(scale)
+    parts.append(SIDES[sides])
+    if rng:
+        parts.extend(rng.split(","))
+    return ",".join(parts)
+
+def image_to_pdf(path, pdf):
+    im = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
+    w, h = im.size
+    im.thumbnail((3508, 2480) if w > h else (2480, 3508))
+    w, h = im.size
+    # A4 par poora aaye, aisi resolution
+    res = max(w / 11.69, h / 8.27) if w > h else max(w / 8.27, h / 11.69)
+    im.save(pdf, "PDF", resolution=max(res, 50))
+
 def count_pages(path):
     try:
         from pypdf import PdfReader
@@ -138,20 +185,138 @@ LOGIN_HTML = """<!doctype html><html lang="hi"><head><meta charset="utf-8">
 <button>Login</button></form></body></html>"""
 
 MAIN_HTML = """<!doctype html><html lang="hi"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Office Print</title>""" + STYLE + """</head><body>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Office Print</title>""" + STYLE + """
+<style>
+.msg{max-width:520px;margin:0 auto 14px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}
+.chk{display:flex;gap:8px;align-items:center}.chk input{width:auto;margin:0}
+.pages{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px;max-height:380px;overflow:auto;background:#e5e7eb;padding:10px;border-radius:10px}
+.paper{background:#fff;box-shadow:0 1px 4px #0004;width:100%;aspect-ratio:0.707;overflow:hidden}
+.cap{text-align:center;font-size:12px;margin-top:4px;color:#555}
+.sum{margin-top:14px;padding:10px;background:#eff6ff;border-radius:8px;font-weight:600;min-height:20px}
+.rerr{color:#c00;margin-top:6px;font-size:14px}
+small{color:#666}
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+</head><body>
 <div class="top"><b>👤 {{user}}</b><span>{% if admin %}<a href="/admin">Admin</a> · {% endif %}<a href="/logout">Logout</a></span></div>
+<div class="msg" id="msg"></div>
 <div class="c"><h2>🖨️ Print karo</h2>
 <label>Printer</label><select id="printer"></select>
 <label>File (PDF / JPG / PNG)</label><input type="file" id="file" accept=".pdf,.jpg,.jpeg,.png,image/*,application/pdf">
-<label>Copies</label><input type="number" id="copies" value="1" min="1" max="50">
-<label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="color" style="width:auto;margin:0"> Color print (warna Black &amp; White)</label>
+</div>
+<div class="c" id="opts" style="display:none">
+<h3>Preview</h3>
+<div class="pages" id="pages"></div><small id="pnote"></small>
+<h3 style="margin-top:18px">Print settings</h3>
+<div class="grid">
+ <div><label>Pages</label><input id="range" placeholder="Saare (ya 1-3,5)" oninput="refresh()"></div>
+ <div><label>Copies</label><input type="number" id="copies" value="1" min="1" max="50" oninput="refresh()"></div>
+ <div><label>Paper size</label><select id="paper" onchange="refresh()"><option value="A4">A4</option><option value="A3">A3</option><option value="A5">A5</option><option value="letter">Letter</option><option value="legal">Legal</option></select></div>
+ <div><label>Orientation</label><select id="orient" onchange="refresh()"><option value="auto">Auto</option><option value="portrait">Portrait (khada)</option><option value="landscape">Landscape (leta)</option></select></div>
+ <div><label>Size</label><select id="scale" onchange="refresh()"><option value="shrink">Page mein aaye (chhota)</option><option value="fit">Poora page bhar do</option><option value="noscale">Asli size</option></select></div>
+ <div><label>Dono taraf (duplex)</label><select id="sides" onchange="refresh()"><option value="single">Ek taraf</option><option value="long">Dono taraf (lamba kinara)</option><option value="short">Dono taraf (chhota kinara)</option></select></div>
+</div>
+<label class="chk"><input type="checkbox" id="color" onchange="refresh()"> Color print (warna Black &amp; White)</label>
+<div class="sum" id="sum"></div><div class="rerr" id="rerr"></div>
+<small>Preview sirf andaza hai. Dono taraf tabhi chalega jab printer duplex support kare.</small>
 <button id="btn" onclick="send()">Print karo</button>
-<div class="msg" id="msg"></div></div>
+</div>
 <div class="c"><h3>Meri jobs</h3><div id="jobs">Abhi koi job nahi.</div></div>
 <script>
 const $=id=>document.getElementById(id);
 const label={waiting:"⏳ Wait",printing:"🖨️ Print ho raha hai",done:"✅ Ho gaya",error:"❌ Error"};
-function show(t,c){const m=$("msg");m.className="msg "+(c||"");m.textContent=t;m.style.display="block"}
+const RATIO={A3:0.707,A4:0.707,A5:0.707,letter:0.773,legal:0.607};
+let pdfDoc=null,imgURL=null,nPages=0,frames=[];
+if(window.pdfjsLib) pdfjsLib.GlobalWorkerOptions.workerSrc="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+function show(t,c){const m=$("msg");m.className="msg "+(c||"");m.textContent=t;m.style.display="block";window.scrollTo(0,0)}
+
+function parseRange(txt,n){
+  txt=txt.replace(/\\s/g,"");
+  if(!txt) return {all:true,count:n,norm:""};
+  const set=new Set(),parts=[];
+  for(const tok of txt.split(",")){
+    const m=/^(\\d+)(?:-(\\d+))?$/.exec(tok);
+    if(!m) return {err:"Pages aise likho: 1-3,5"};
+    const a=+m[1], b=m[2]?+m[2]:a;
+    if(a<1||b<a) return {err:"Page number galat hai."};
+    if(n>0&&b>n) return {err:"File mein sirf "+n+" page hain."};
+    if(b>5000) return {err:"Page number bahut bada hai."};
+    for(let i=a;i<=b;i++) set.add(i);
+    parts.push(a+"-"+b);
+  }
+  return {all:false,set:set,count:set.size,norm:parts.join(",")};
+}
+
+function addFrame(el,i,ratio){
+  const box=document.createElement("div");
+  const paper=document.createElement("div"); paper.className="paper";
+  el.style.width="100%"; el.style.height="100%"; el.style.objectFit="contain"; el.style.display="block";
+  paper.appendChild(el);
+  const cap=document.createElement("div"); cap.className="cap"; cap.textContent="Page "+i;
+  box.appendChild(paper); box.appendChild(cap); $("pages").appendChild(box);
+  frames.push({i:i,ratio:ratio,el:el,paper:paper,box:box});
+}
+
+function refresh(){
+  const r=parseRange($("range").value,nPages);
+  $("rerr").textContent=r.err||"";
+  const base=RATIO[$("paper").value], orient=$("orient").value, gray=!$("color").checked;
+  const copies=Math.max(1,Math.min(50,parseInt($("copies").value)||1));
+  frames.forEach(fr=>{
+    const ratio=orient=="portrait"?base:(orient=="landscape"?1/base:(fr.ratio>1?1/base:base));
+    fr.paper.style.aspectRatio=String(ratio);
+    fr.el.style.filter=gray?"grayscale(1)":"none";
+    const inr=!r.err&&(r.all||r.set.has(fr.i));
+    fr.box.style.opacity=inr?1:0.25;
+  });
+  if(r.err){$("sum").textContent="";return}
+  const per=r.count||0, duplex=$("sides").value!="single";
+  let t="Copies: "+copies;
+  if(per){
+    const sheets=(duplex?Math.ceil(per/2):per)*copies;
+    t="Total: "+per+" page × "+copies+" copy = "+(per*copies)+" page ("+sheets+" kagaz"+(duplex?", dono taraf":"")+")";
+  }
+  $("sum").textContent=t;
+}
+
+function resetPreview(){
+  $("pages").innerHTML=""; $("pnote").textContent=""; frames=[]; nPages=0;
+  if(pdfDoc){pdfDoc.destroy();pdfDoc=null}
+  if(imgURL){URL.revokeObjectURL(imgURL);imgURL=null}
+}
+
+async function loadPreview(){
+  const f=$("file").files[0]; resetPreview();
+  if(!f){$("opts").style.display="none";return}
+  $("opts").style.display="block"; $("pages").textContent="Preview ban raha hai...";
+  try{
+    if(f.name.toLowerCase().endsWith(".pdf")||f.type=="application/pdf"){
+      const buf=await f.arrayBuffer();
+      pdfDoc=await pdfjsLib.getDocument({data:buf}).promise; nPages=pdfDoc.numPages;
+      $("pages").innerHTML="";
+      const lim=Math.min(nPages,30);
+      for(let i=1;i<=lim;i++){
+        const pg=await pdfDoc.getPage(i), v0=pg.getViewport({scale:1}), v=pg.getViewport({scale:300/v0.width});
+        const cv=document.createElement("canvas"); cv.width=v.width; cv.height=v.height;
+        await pg.render({canvasContext:cv.getContext("2d"),viewport:v}).promise;
+        addFrame(cv,i,v0.width/v0.height);
+      }
+      $("pnote").textContent=nPages+" page"+(nPages>30?" (preview mein pehle 30 dikh rahe hain)":"");
+    }else{
+      const img=new Image(); imgURL=URL.createObjectURL(f);
+      await new Promise((ok,bad)=>{img.onload=ok;img.onerror=bad;img.src=imgURL});
+      nPages=1; $("pages").innerHTML=""; addFrame(img,1,img.naturalWidth/img.naturalHeight);
+      $("pnote").textContent="1 page (photo)";
+    }
+  }catch(e){
+    nPages=0; $("pages").textContent="Preview nahi ban paya, par print ho sakta hai.";
+  }
+  refresh();
+}
+$("file").addEventListener("change",loadPreview);
+
 async function loadPrinters(){
   const r=await (await fetch("/api/printers")).json(), s=$("printer"), cur=s.value;
   s.innerHTML="";
@@ -160,6 +325,7 @@ async function loadPrinters(){
   if(!r.length){const o=document.createElement("option");o.textContent="Koi printer online nahi";s.appendChild(o)}
   if(cur) s.value=cur;
 }
+
 async function loadJobs(){
   const r=await (await fetch("/api/jobs")).json(); if(!r.length) return;
   const box=$("jobs"); box.innerHTML="";
@@ -168,14 +334,21 @@ async function loadJobs(){
     const b=document.createElement("span");b.textContent=label[j.status]+(j.status=="waiting"?" (aage "+j.ahead+")":"")+(j.status=="error"?": "+(j.error||""):"");
     d.appendChild(a);d.appendChild(b);box.appendChild(d)});
 }
+
 async function send(){
   const f=$("file").files[0]; if(!f){show("Pehle file chuno.","err");return}
+  const r=parseRange($("range").value,nPages); if(r.err){show(r.err,"err");return}
   const fd=new FormData(); fd.append("file",f); fd.append("printer",$("printer").value);
   fd.append("copies",$("copies").value); fd.append("color",$("color").checked?"1":"0");
+  fd.append("paper",$("paper").value); fd.append("orient",$("orient").value);
+  fd.append("scale",$("scale").value); fd.append("sides",$("sides").value); fd.append("range",r.norm);
   $("btn").disabled=true; show("Bhej raha hoon...");
   try{
-    const r=await fetch("/api/print",{method:"POST",body:fd}), d=await r.json();
-    if(r.ok){show(d.message,d.warn?"":"ok"); $("file").value="";} else show(d.error||"Error aaya","err");
+    const res=await fetch("/api/print",{method:"POST",body:fd}), d=await res.json();
+    if(res.ok){
+      show(d.message,d.warn?"":"ok");
+      $("file").value=""; resetPreview(); $("opts").style.display="none"; $("range").value="";
+    }else show(d.error||"Error aaya","err");
   }catch(e){show("Server se connect nahi hua.","err")}
   $("btn").disabled=false; loadPrinters(); loadJobs();
 }
@@ -276,6 +449,13 @@ def api_print():
         copies = max(1, min(50, int(request.form.get("copies", 1))))
     except ValueError:
         copies = 1
+    color = request.form.get("color") == "1"
+    paper = request.form.get("paper", "A4")
+    orient = request.form.get("orient", "auto")
+    scale = request.form.get("scale", "shrink")
+    sides = request.form.get("sides", "single")
+    if paper not in PAPERS or orient not in ORIENTS or scale not in SCALES or sides not in SIDES:
+        return jsonify({"error": "Print settings sahi nahi hain."}), 400
 
     jid = uuid.uuid4().hex[:10]
     path = os.path.join(UPLOAD_DIR, jid + ext)
@@ -283,20 +463,26 @@ def api_print():
     try:
         if ext != ".pdf":
             pdf = os.path.join(UPLOAD_DIR, jid + ".pdf")
-            Image.open(path).convert("RGB").save(pdf, "PDF", resolution=150)
+            image_to_pdf(path, pdf)
             os.remove(path)
             path = pdf
-        pages = count_pages(path)
+        total = count_pages(path)
+        try:
+            rng, pages = parse_range(request.form.get("range", ""), total)
+        except ValueError:
+            os.remove(path)
+            return jsonify({"error": f"Pages galat hain. File mein {total} page hain. Aise likho: 1-3,5"}), 400
     except Exception:
         if os.path.exists(path):
             os.remove(path)
         return jsonify({"error": "File kharab hai ya khul nahi rahi."}), 400
 
+    settings = build_settings(copies, color, paper, orient, scale, sides, rng)
     ahead = ahead_count(pid)
-    run("""INSERT INTO jobs(id,user,filename,printer_id,copies,color,pages,status,created,path)
-           VALUES(?,?,?,?,?,?,?,'waiting',?,?)""",
+    run("""INSERT INTO jobs(id,user,filename,printer_id,copies,color,pages,status,created,path,settings)
+           VALUES(?,?,?,?,?,?,?,'waiting',?,?,?)""",
         (jid, u["username"], (f.filename or "file")[:60], pid, copies,
-         1 if request.form.get("color") == "1" else 0, pages, time.time(), path), write=True)
+         1 if color else 0, pages, time.time(), path, settings), write=True)
 
     online = time.time() - printer["last_seen"] < ONLINE_SECONDS
     if not online:
@@ -381,7 +567,8 @@ def agent_claim():
         c.close()
     if not job:
         return jsonify({"job": None})
-    return jsonify({"job": {"id": job["id"], "copies": job["copies"], "color": bool(job["color"])}})
+    return jsonify({"job": {"id": job["id"], "copies": job["copies"], "color": bool(job["color"]),
+                            "settings": job["settings"]}})
 
 @app.route("/agent/file/<jid>")
 def agent_file(jid):

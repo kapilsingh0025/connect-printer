@@ -4,8 +4,9 @@ Env variables (Render mein set karo):
   ADMIN_USER, ADMIN_PASS   -> admin ka login
   AGENT_KEY                -> office PC wale agent ka secret key (lamba random)
   SECRET_KEY               -> session ke liye lamba random text
-  USERS (optional)         -> "rahul:pass1,amit:pass2"  (har restart par ye users ban jaate hain)
-  DATA_DIR (optional)      -> persistent disk ka path, jaise /data
+  DATABASE_URL (zaroori)   -> Neon/Supabase Postgres ka link (isse users kabhi nahi mitenge)
+  USERS (optional)         -> "rahul:pass1,amit:pass2"  (sirf shuruaati users; baad mein admin page se)
+  DATA_DIR (optional)      -> persistent disk ka path, jaise /data (agar Postgres nahi lena)
 """
 import os, re, time, uuid, sqlite3, hmac, shutil, subprocess, tempfile, threading
 from datetime import timedelta
@@ -45,15 +46,32 @@ app.config.update(MAX_CONTENT_LENGTH=25 * 1024 * 1024,
                   SESSION_COOKIE_SECURE=os.environ.get("INSECURE_COOKIES") != "1")
 
 # ---------------- database ----------------
+# DATABASE_URL set ho to Postgres (permanent, users kabhi nahi mitenge). Warna SQLite (Render free par restart par mit jata hai).
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+USE_PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
+if USE_PG:
+    import psycopg2
+    import psycopg2.extras
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = "postgresql://" + DATABASE_URL[len("postgres://"):]
+
 def db():
+    if USE_PG:
+        return psycopg2.connect(DATABASE_URL, connect_timeout=15)
     c = sqlite3.connect(DB_PATH, timeout=15)
     c.row_factory = sqlite3.Row
     return c
 
+def _cursor(c):
+    return c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) if USE_PG else c.cursor()
+
 def run(sql, args=(), one=False, write=False):
+    if USE_PG:
+        sql = sql.replace("?", "%s")
     c = db()
     try:
-        cur = c.execute(sql, args)
+        cur = _cursor(c)
+        cur.execute(sql, args)
         if write:
             c.commit()
             return cur.rowcount
@@ -63,31 +81,31 @@ def run(sql, args=(), one=False, write=False):
         c.close()
 
 def init():
-    c = db()
-    c.executescript("""
-    CREATE TABLE IF NOT EXISTS users(username TEXT PRIMARY KEY, pw TEXT, is_admin INTEGER DEFAULT 0, created REAL);
-    CREATE TABLE IF NOT EXISTS printers(id TEXT PRIMARY KEY, label TEXT, last_seen REAL);
-    CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, user TEXT, filename TEXT, printer_id TEXT,
-        copies INTEGER, color INTEGER, pages INTEGER, status TEXT, error TEXT,
-        created REAL, claimed REAL, finished REAL, path TEXT);
-    """)
-    try:
-        c.execute("ALTER TABLE jobs ADD COLUMN settings TEXT")
-    except sqlite3.OperationalError:
-        pass
-    c.execute("""INSERT INTO users(username,pw,is_admin,created) VALUES(?,?,1,?)
-                 ON CONFLICT(username) DO UPDATE SET pw=excluded.pw, is_admin=1""",
-              (ADMIN_USER, generate_password_hash(ADMIN_PASS), time.time()))
+    ts = "DOUBLE PRECISION"
+    run(f"CREATE TABLE IF NOT EXISTS users(username TEXT PRIMARY KEY, pw TEXT, is_admin INTEGER DEFAULT 0, created {ts})", write=True)
+    run(f"CREATE TABLE IF NOT EXISTS printers(id TEXT PRIMARY KEY, label TEXT, last_seen {ts})", write=True)
+    run(f"""CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, owner TEXT, filename TEXT, printer_id TEXT,
+            copies INTEGER, color INTEGER, pages INTEGER, status TEXT, error TEXT,
+            created {ts}, claimed {ts}, finished {ts}, path TEXT, settings TEXT)""", write=True)
+    if not USE_PG:      # purani SQLite database ka migration
+        cols = [r["name"] for r in run("PRAGMA table_info(jobs)")]
+        if "user" in cols and "owner" not in cols:
+            run('ALTER TABLE jobs RENAME COLUMN "user" TO owner', write=True)
+        if "settings" not in cols:
+            run("ALTER TABLE jobs ADD COLUMN settings TEXT", write=True)
+    # admin: har start par .env ke hisaab se
+    run("""INSERT INTO users(username,pw,is_admin,created) VALUES(?,?,1,?)
+           ON CONFLICT(username) DO UPDATE SET pw=excluded.pw, is_admin=1""",
+        (ADMIN_USER, generate_password_hash(ADMIN_PASS), time.time()), write=True)
+    # USERS env: sirf shuruaati users (pehle se ho to chhedta nahi)
     for pair in os.environ.get("USERS", "").split(","):
         if ":" in pair:
             u, p = pair.split(":", 1)
             u = u.strip().lower()
             if u and p:
-                c.execute("""INSERT INTO users(username,pw,is_admin,created) VALUES(?,?,0,?)
-                             ON CONFLICT(username) DO UPDATE SET pw=excluded.pw WHERE is_admin=0""",
-                          (u, generate_password_hash(p), time.time()))
-    c.commit()
-    c.close()
+                run("""INSERT INTO users(username,pw,is_admin,created) VALUES(?,?,0,?)
+                       ON CONFLICT(username) DO NOTHING""",
+                    (u, generate_password_hash(p), time.time()), write=True)
 
 init()
 
@@ -119,7 +137,7 @@ def ahead_count(printer_id, created=None):
 PAPERS = {"A3": "A3", "A4": "A4", "A5": "A5", "letter": "letter", "legal": "legal"}
 PAPER_PT = {"A3": (842, 1191), "A4": (595, 842), "A5": (420, 595), "letter": (612, 792), "legal": (612, 1008)}
 ORIENTS = {"auto", "portrait", "landscape"}
-SCALES = {"shrink", "fit", "noscale"}
+SCALES = {"shrink", "fit", "noscale", "custom"}
 SIDES = {"single": "simplex", "long": "duplexlong", "short": "duplexshort"}
 NUP_GRID = {2: (1, 2), 4: (2, 2), 6: (2, 3), 9: (3, 3)}   # (cols, rows) portrait sheet
 
@@ -151,7 +169,7 @@ def select_pages(mode, rng, n):
         raise ValueError
     return base
 
-def process_pdf(src, dst, sel, orient, nup, paper):
+def process_pdf(src, dst, sel, orient, nup, paper, scale="shrink", pct=100):
     """Chune hue pages nikalo, orientation lagao, pages-per-sheet banao. Sumatra ke liye orientation token lautata hai."""
     from pypdf import PdfReader, PdfWriter, PageObject, Transformation
     r = PdfReader(src)
@@ -168,9 +186,24 @@ def process_pdf(src, dst, sel, orient, nup, paper):
     if nup == 1:
         for p in pages:
             ww, hh = size(p)
+            rotated = False
             if orient != "auto" and (ww > hh) != (orient == "landscape"):
                 p.rotate(90)
-            w.add_page(p)
+                rotated = True
+            if scale == "custom":
+                if rotated:
+                    p.transfer_rotation_to_content()
+                ww, hh = size(p)
+                land = (ww > hh) if orient == "auto" else (orient == "landscape")
+                sw, sh = (ph0, pw0) if land else (pw0, ph0)
+                f = pct / 100.0
+                sheet = PageObject.create_blank_page(width=sw, height=sh)
+                tr = (Transformation().translate(-float(p.mediabox.left), -float(p.mediabox.bottom))
+                      .scale(f, f).translate((sw - ww * f) / 2, (sh - hh * f) / 2))
+                sheet.merge_transformed_page(p, tr)
+                w.add_page(sheet)
+            else:
+                w.add_page(p)
         token = orient if orient != "auto" else None
     else:
         fw, fh = size(pages[0])
@@ -265,13 +298,91 @@ table{width:100%;border-collapse:collapse;font-size:14px}td,th{padding:6px 4px;b
 a{color:#2563eb}.e{color:#c00;margin-top:8px}
 </style>"""
 
-LOGIN_HTML = """<!doctype html><html lang="hi"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Office Print - Login</title>""" + STYLE + """</head><body>
-<form class="c" method="post" style="max-width:360px;margin-top:40px"><h2>🖨️ Office Print</h2>
-<input name="u" placeholder="Username" autocapitalize="none" autocomplete="username" required>
-<input name="p" type="password" placeholder="Password" autocomplete="current-password" required>
-{% if err %}<div class="e">{{err}}</div>{% endif %}
-<button>Login</button></form></body></html>"""
+LOGIN_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#1d4ed8">
+<title>Sign in · Office Print</title>
+<style>
+:root{--blue:#2563eb;--ink:#0f172a;--mut:#64748b;--line:#e2e8f0}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;color:var(--ink);background:#f1f5f9}
+.shell{min-height:100%;display:grid;grid-template-columns:1.05fr 1fr}
+.hero{background:linear-gradient(145deg,#1e3a8a 0%,#2563eb 58%,#38bdf8 125%);color:#fff;padding:56px;display:flex;flex-direction:column;justify-content:space-between;position:relative;overflow:hidden}
+.hero:before,.hero:after{content:"";position:absolute;border-radius:50%;background:rgba(255,255,255,.08)}
+.hero:before{width:420px;height:420px;right:-140px;top:-120px}
+.hero:after{width:300px;height:300px;left:-100px;bottom:-110px}
+.hero>*{position:relative;z-index:1}
+.brand{display:flex;align-items:center;gap:12px;font-weight:700;font-size:20px}
+.logo{width:44px;height:44px;border-radius:13px;background:rgba(255,255,255,.18);display:grid;place-items:center}
+.hero h1{font-size:38px;line-height:1.15;margin:0 0 14px;letter-spacing:-.5px}
+.hero p{margin:0;color:#dbeafe;font-size:16px;max-width:420px;line-height:1.5}
+.feats{list-style:none;padding:0;margin:30px 0 0;display:grid;gap:14px}
+.feats li{display:flex;gap:12px;align-items:center;font-size:15px}
+.feats i{width:32px;height:32px;border-radius:10px;background:rgba(255,255,255,.18);display:grid;place-items:center;flex:none}
+.foot{font-size:13px;color:#bfdbfe}
+.side{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:32px 20px}
+.card{width:100%;max-width:400px;background:#fff;border-radius:18px;padding:36px 32px;border:1px solid var(--line);box-shadow:0 10px 40px rgba(15,23,42,.08),0 1px 3px rgba(15,23,42,.06)}
+.mbrand{display:none;align-items:center;gap:10px;color:#fff;font-weight:700;font-size:20px;margin-bottom:20px}
+.mbrand .logo{background:rgba(255,255,255,.2)}
+h2{margin:0 0 6px;font-size:26px;letter-spacing:-.3px}
+.sub{margin:0 0 8px;color:var(--mut);font-size:15px}
+label{display:block;font-size:13px;font-weight:600;margin:18px 0 6px;color:#334155}
+.field{position:relative}
+.field .ic{position:absolute;left:14px;top:50%;transform:translateY(-50%);color:#94a3b8;pointer-events:none;display:flex}
+input{width:100%;height:48px;padding:0 46px 0 44px;font-size:16px;border:1.5px solid var(--line);border-radius:12px;background:#f8fafc;color:var(--ink);outline:none;transition:.15s;font-family:inherit}
+input:focus{border-color:var(--blue);background:#fff;box-shadow:0 0 0 4px rgba(37,99,235,.12)}
+.eye{position:absolute;right:6px;top:50%;transform:translateY(-50%);width:38px;height:38px;border:0;background:none;color:#94a3b8;cursor:pointer;border-radius:8px;display:grid;place-items:center}
+.eye:hover{color:#475569;background:#f1f5f9}
+.err{margin-top:18px;padding:11px 14px;border-radius:10px;background:#fef2f2;color:#b91c1c;font-size:14px;border:1px solid #fecaca;display:flex;gap:8px;align-items:center}
+button.go{margin-top:24px;width:100%;height:50px;border:0;border-radius:12px;background:linear-gradient(180deg,#3b82f6,#2563eb);color:#fff;font-size:16px;font-weight:600;cursor:pointer;box-shadow:0 4px 14px rgba(37,99,235,.35);transition:.15s;font-family:inherit}
+button.go:hover{filter:brightness(1.06)}
+button.go:active{transform:translateY(1px)}
+button.go[disabled]{opacity:.7;cursor:wait}
+.note{margin-top:22px;text-align:center;font-size:13px;color:var(--mut)}
+@media(max-width:860px){
+  body{background:linear-gradient(160deg,#1e3a8a,#2563eb 60%,#38bdf8) fixed}
+  .shell{grid-template-columns:1fr}.hero{display:none}
+  .mbrand{display:flex}.side{padding:24px 16px}.card{padding:28px 22px}
+}
+</style></head><body>
+<div class="shell">
+ <section class="hero">
+  <div class="brand"><span class="logo"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg></span>Office Print</div>
+  <div>
+   <h1>Print from your phone.<br>No cables, no queues.</h1>
+   <p>Upload a document, check the preview, choose your settings and it prints on the office printer.</p>
+   <ul class="feats">
+    <li><i><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg></i>Works with any phone or computer</li>
+    <li><i><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></i>Live queue &mdash; know when your turn comes</li>
+    <li><i><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></i>Private &mdash; files are deleted after printing</li>
+   </ul>
+  </div>
+  <div class="foot">Secure office printing</div>
+ </section>
+ <main class="side">
+  <div class="mbrand"><span class="logo"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg></span>Office Print</div>
+  <form class="card" method="post" id="f">
+   <h2>Welcome back</h2>
+   <p class="sub">Sign in to start printing.</p>
+   <label for="u">Username</label>
+   <div class="field"><span class="ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></span>
+    <input id="u" name="u" placeholder="Enter your username" autocapitalize="none" autocomplete="username" autofocus required></div>
+   <label for="p">Password</label>
+   <div class="field"><span class="ic"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span>
+    <input id="p" name="p" type="password" placeholder="Enter your password" autocomplete="current-password" required>
+    <button type="button" class="eye" id="eye" aria-label="Show password"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button></div>
+   {% if err %}<div class="err" role="alert"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex:none"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg><span>{{err}}</span></div>{% endif %}
+   <button class="go" id="go">Sign in</button>
+   <div class="note">Trouble signing in? Ask your office admin.</div>
+  </form>
+ </main>
+</div>
+<script>
+const p=document.getElementById("p");
+document.getElementById("eye").onclick=function(){p.type=p.type=="password"?"text":"password"};
+document.getElementById("f").addEventListener("submit",function(){var b=document.getElementById("go");b.disabled=true;b.textContent="Signing in..."});
+</script>
+</body></html>"""
 
 MAIN_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Print</title>""" + STYLE + r"""
@@ -320,7 +431,8 @@ small{color:#666}
   <div class="row"><label>Color</label><select id="color" onchange="refresh()"><option value="0">Black and white</option><option value="1">Color</option></select></div>
   <div class="row"><label>Paper size</label><select id="paper" onchange="refresh()"><option value="A4">A4</option><option value="A3">A3</option><option value="A5">A5</option><option value="letter">Letter</option><option value="legal">Legal</option></select></div>
   <div class="row"><label>Pages per sheet</label><select id="nup" onchange="cur=0;refresh()"><option value="1">1</option><option value="2">2</option><option value="4">4</option><option value="6">6</option><option value="9">9</option></select></div>
-  <div class="row"><label>Scale</label><select id="scale" onchange="refresh()"><option value="shrink">Shrink to fit</option><option value="fit">Fit to page</option><option value="noscale">Actual size</option></select></div>
+  <div class="row"><label>Scale</label><select id="scale" onchange="refresh()"><option value="shrink">Shrink to fit</option><option value="fit">Fit to page</option><option value="noscale">Actual size (100%)</option><option value="custom">Custom...</option></select></div>
+  <div class="row" id="pctrow" style="display:none"><label>Custom scale</label><input type="number" id="pct" value="100" min="10" max="400" step="5" oninput="refresh()"><span style="font-weight:600">%</span></div>
   <div class="row"><label>Two-sided</label><select id="sides" onchange="refresh()"><option value="single">Off</option><option value="long">Flip on long edge</option><option value="short">Flip on short edge</option></select></div>
   <div class="rerr" id="rerr" style="color:#c00;font-size:14px"></div>
   <small>Preview is approximate. Two-sided works only if the printer supports it.</small>
@@ -385,7 +497,7 @@ function computeSheet(o,sizes,first){
     const sw=land?P[1]:P[0], sh=land?P[0]:P[1];
     const rot=pl!=land, cw=rot?z.h:z.w, ch=rot?z.w:z.h;
     const fitS=Math.min(sw/cw,sh/ch);
-    const s=o.scale=="noscale"?1:(o.scale=="fit"?fitS:Math.min(1,fitS));
+    const s=o.scale=="custom"?(o.pct/100):(o.scale=="noscale"?1:(o.scale=="fit"?fitS:Math.min(1,fitS)));
     return {sw:sw,sh:sh,items:[{i:0,rot:rot,w:z.w*s,h:z.h*s,cx:sw/2,cy:sh/2}]};
   }
   const land=o.orient=="auto"?((o.nup==2||o.nup==6)?!fl:fl):o.orient=="landscape";
@@ -448,7 +560,7 @@ async function showSheet(){
   try{
     const sizes=await Promise.all(chunk.map(getSize)), first=await getSize(sel.list[0]), srcs=await Promise.all(chunk.map(getSrc));
     if(tok!=renderTok) return;
-    const L=computeSheet({nup:nup,orient:$("orient").value,scale:$("scale").value,paper:$("paper").value},sizes,first);
+    const L=computeSheet({nup:nup,orient:$("orient").value,scale:$("scale").value,paper:$("paper").value,pct:Math.max(10,Math.min(400,parseInt($("pct").value)||100))},sizes,first);
     const avail=Math.max(180,Math.min($("sheetwrap").clientWidth-8,460));
     const k=Math.min(avail/L.sw,520/L.sh);
     box.style.display="block"; box.style.width=(L.sw*k)+"px"; box.style.height=(L.sh*k)+"px"; box.innerHTML="";
@@ -467,6 +579,7 @@ async function showSheet(){
 function refresh(){
   $("rangerow").style.display=$("pmode").value=="custom"?"flex":"none";
   $("scale").disabled=$("nup").value!="1";
+  $("pctrow").style.display=($("scale").value=="custom"&&$("nup").value=="1")?"flex":"none";
   showSheet();
 }
 $("prev").onclick=()=>{cur--;showSheet()};
@@ -536,7 +649,7 @@ async function send(){
   const fd=new FormData(); fd.append("file",f); fd.append("printer",$("printer").value);
   fd.append("copies",$("copies").value); fd.append("color",$("color").value);
   fd.append("paper",$("paper").value); fd.append("orient",$("orient").value);
-  fd.append("scale",$("scale").value); fd.append("sides",$("sides").value);
+  fd.append("scale",$("scale").value); fd.append("scale_pct",$("pct").value); fd.append("sides",$("sides").value);
   fd.append("nup",$("nup").value); fd.append("mode",$("pmode").value);
   fd.append("range",$("pmode").value=="custom"?$("range").value:"");
   $("btn").disabled=true; show("Sending...");
@@ -554,6 +667,7 @@ ADMIN_HTML = """<!doctype html><html lang="hi"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Admin</title>""" + STYLE + """</head><body>
 <div class="top"><a href="/">← Print page</a><a href="/logout">Logout</a></div>
 {% if flash %}<div class="c" style="background:#d1fae5">{{flash}}</div>{% endif %}
+<div class="c" style="background:{{'#d1fae5' if permanent else '#fef3c7'}}"><small>{{ '✅ Permanent database: users aur history safe hain.' if permanent else '⚠️ Temporary storage: Render restart par users mit sakte hain. DATABASE_URL set karo.' }}</small></div>
 <div class="c"><h3>Naya user / password badlo</h3>
 <form method="post" action="/admin/add">
 <input name="u" placeholder="Username" autocapitalize="none" required>
@@ -568,7 +682,7 @@ ADMIN_HTML = """<!doctype html><html lang="hi"><head><meta charset="utf-8">
 {% for p in printers %}<tr><td>{{p.label}}</td><td>{{"🟢 online" if p.online else "🔴 band"}}</td></tr>{% endfor %}
 {% if not printers %}<tr><td>Abhi koi agent connect nahi hua.</td></tr>{% endif %}</table></div>
 <div class="c"><h3>Haal ki jobs</h3><table>
-{% for j in recent %}<tr><td>{{j.user}}</td><td>{{j.filename}}</td><td>{{j.status}}</td></tr>{% endfor %}
+{% for j in recent %}<tr><td>{{j.owner}}</td><td>{{j.filename}}</td><td>{{j.status}}</td></tr>{% endfor %}
 </table></div></body></html>"""
 
 # ---------------- user pages ----------------
@@ -623,7 +737,7 @@ def api_jobs():
     if not u:
         return jsonify([]), 401
     rows = run("""SELECT j.*, p.label FROM jobs j LEFT JOIN printers p ON p.id=j.printer_id
-                  WHERE j.user=? ORDER BY j.created DESC LIMIT 8""", (u["username"],))
+                  WHERE j.owner=? ORDER BY j.created DESC LIMIT 8""", (u["username"],))
     return jsonify([{"file": r["filename"], "printer": r["label"] or "?", "status": r["status"],
                      "error": r["error"], "ahead": ahead_count(r["printer_id"], r["created"])} for r in rows])
 
@@ -679,6 +793,12 @@ def api_print():
     scale = request.form.get("scale", "shrink")
     sides = request.form.get("sides", "single")
     mode = request.form.get("mode", "all")
+    try:
+        pct = int(request.form.get("scale_pct", 100))
+    except ValueError:
+        pct = 100
+    if scale == "custom" and nup == 1 and not (10 <= pct <= 400):
+        return jsonify({"error": "Custom scale 10% se 400% ke beech rakho."}), 400
     if (paper not in PAPERS or orient not in ORIENTS or scale not in SCALES
             or sides not in SIDES or nup not in (1, 2, 4, 6, 9)):
         return jsonify({"error": "Print settings sahi nahi hain."}), 400
@@ -703,7 +823,7 @@ def api_print():
             return jsonify({"error": f"Koi page select nahi hua ya pages galat hain. File mein {total} page hain. Aise likho: 1-3,5"}), 400
         out = os.path.join(UPLOAD_DIR, jid + "_out.pdf")
         junk.append(out)
-        token = process_pdf(path, out, sel, orient, nup, paper)
+        token = process_pdf(path, out, sel, orient, nup, paper, scale, pct)
         for j in junk[:-1]:
             if os.path.exists(j):
                 os.remove(j)
@@ -716,9 +836,10 @@ def api_print():
             return jsonify({"error": NO_OFFICE_MSG}), 501
         return jsonify({"error": "File kharab hai ya khul nahi rahi."}), 400
 
-    settings = build_settings(copies, color, paper, token, "shrink" if nup > 1 else scale, sides)
+    eff_scale = "shrink" if nup > 1 else ("noscale" if scale == "custom" else scale)
+    settings = build_settings(copies, color, paper, token, eff_scale, sides)
     ahead = ahead_count(pid)
-    run("""INSERT INTO jobs(id,user,filename,printer_id,copies,color,pages,status,created,path,settings)
+    run("""INSERT INTO jobs(id,owner,filename,printer_id,copies,color,pages,status,created,path,settings)
            VALUES(?,?,?,?,?,?,?,'waiting',?,?,?)""",
         (jid, u["username"], (f.filename or "file")[:60], pid, copies,
          1 if color else 0, len(sel), time.time(), path, settings), write=True)
@@ -740,14 +861,14 @@ def admin():
     if not admin_required():
         return redirect("/login")
     users = run("""SELECT u.username, u.is_admin,
-                   (SELECT COUNT(*) FROM jobs j WHERE j.user=u.username AND j.status='done') jobs,
-                   (SELECT COALESCE(SUM(j.pages*j.copies),0) FROM jobs j WHERE j.user=u.username AND j.status='done') pages
+                   (SELECT COUNT(*) FROM jobs j WHERE j.owner=u.username AND j.status='done') jobs,
+                   (SELECT COALESCE(SUM(j.pages*j.copies),0) FROM jobs j WHERE j.owner=u.username AND j.status='done') pages
                    FROM users u ORDER BY u.username""")
     now = time.time()
     printers = [{"label": p["label"], "online": now - p["last_seen"] < ONLINE_SECONDS}
                 for p in run("SELECT * FROM printers ORDER BY label")]
-    recent = run("SELECT user,filename,status FROM jobs ORDER BY created DESC LIMIT 20")
-    return render_template_string(ADMIN_HTML, users=users, printers=printers, recent=recent,
+    recent = run("SELECT owner,filename,status FROM jobs ORDER BY created DESC LIMIT 20")
+    return render_template_string(ADMIN_HTML, users=users, printers=printers, recent=recent, permanent=USE_PG,
                                   flash=request.args.get("m"))
 
 @app.route("/admin/add", methods=["POST"])
@@ -759,7 +880,7 @@ def admin_add():
     if not u or len(p) < 4 or u == ADMIN_USER:
         return redirect("/admin?m=Username/password sahi nahi hai (password kam se kam 4 akshar).")
     run("""INSERT INTO users(username,pw,is_admin,created) VALUES(?,?,0,?)
-           ON CONFLICT(username) DO UPDATE SET pw=excluded.pw WHERE is_admin=0""",
+           ON CONFLICT(username) DO UPDATE SET pw=excluded.pw WHERE users.is_admin=0""",
         (u, generate_password_hash(p), time.time()), write=True)
     return redirect("/admin?m=Save ho gaya: " + u)
 
@@ -777,13 +898,10 @@ def agent_heartbeat():
         abort(403)
     d = request.get_json(force=True)
     agent = str(d.get("agent", "PC"))[:40]
-    c = db()
     for name in d.get("printers", []):
-        c.execute("""INSERT INTO printers(id,label,last_seen) VALUES(?,?,?)
-                     ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen""",
-                  (f"{agent}|{name}", f"{name} ({agent})", time.time()))
-    c.commit()
-    c.close()
+        run("""INSERT INTO printers(id,label,last_seen) VALUES(?,?,?)
+               ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen""",
+            (f"{agent}|{name}", f"{name} ({agent})", time.time()), write=True)
     return jsonify({"ok": True})
 
 @app.route("/agent/claim", methods=["POST"])
@@ -795,16 +913,30 @@ def agent_claim():
     now = time.time()
     c = db()
     try:
-        c.execute("BEGIN IMMEDIATE")
-        c.execute("UPDATE jobs SET status='waiting' WHERE status='printing' AND claimed<?", (now - STUCK_SECONDS,))
-        job = c.execute("""SELECT * FROM jobs WHERE printer_id=? AND status='waiting'
-                           ORDER BY created LIMIT 1""", (pid,)).fetchone()
-        if job:
-            c.execute("UPDATE jobs SET status='printing', claimed=? WHERE id=?", (now, job["id"]))
-        c.commit()
+        if USE_PG:
+            cur = _cursor(c)
+            cur.execute("UPDATE jobs SET status='waiting' WHERE status='printing' AND claimed<%s", (now - STUCK_SECONDS,))
+            cur.execute("""UPDATE jobs SET status='printing', claimed=%s
+                           WHERE id=(SELECT id FROM jobs WHERE printer_id=%s AND status='waiting'
+                                     ORDER BY created LIMIT 1 FOR UPDATE SKIP LOCKED)
+                           RETURNING id, copies, color, settings, path""", (now, pid))
+            job = cur.fetchone()
+            c.commit()
+        else:
+            c.execute("BEGIN IMMEDIATE")
+            c.execute("UPDATE jobs SET status='waiting' WHERE status='printing' AND claimed<?", (now - STUCK_SECONDS,))
+            job = c.execute("""SELECT * FROM jobs WHERE printer_id=? AND status='waiting'
+                               ORDER BY created LIMIT 1""", (pid,)).fetchone()
+            if job:
+                c.execute("UPDATE jobs SET status='printing', claimed=? WHERE id=?", (now, job["id"]))
+            c.commit()
     finally:
         c.close()
     if not job:
+        return jsonify({"job": None})
+    if not job["path"] or not os.path.exists(job["path"]):     # server restart mein file ud gayi
+        run("UPDATE jobs SET status='error', error=?, finished=? WHERE id=?",
+            ("File server restart mein hat gayi, dobara bhejo", time.time(), job["id"]), write=True)
         return jsonify({"job": None})
     return jsonify({"job": {"id": job["id"], "copies": job["copies"], "color": bool(job["color"]),
                             "settings": job["settings"]}})

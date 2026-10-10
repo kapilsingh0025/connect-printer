@@ -2,3 +2,4 @@ flask
 gunicorn
 pillow
 pypdf
+psycopg2-binary

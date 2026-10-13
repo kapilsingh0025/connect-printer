@@ -1,0 +1,6 @@
+{
+  "SERVER_URL": "https://YOUR-RENDER-SERVICE.onrender.com",
+  "AGENT_KEY": "REPLACE_WITH_THE_SAME_LONG_RANDOM_KEY_AS_SERVER",
+  "AGENT_NAME": "Office-PC",
+  "PRINTERS": []
+}

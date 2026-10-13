@@ -35,7 +35,8 @@ NO_OFFICE_MSG = "Is server par Word/Excel/PowerPoint support chalu nahi hai. Abh
 SOFFICE = shutil.which("soffice") or shutil.which("libreoffice")   # Docker mein LibreOffice hota hai
 convert_lock = threading.Lock()                                    # ek baar mein ek hi conversion (memory bachane ko)
 ONLINE_SECONDS = 30       # itne second mein agent ka heartbeat aaye to printer "online"
-STUCK_SECONDS = 600       # printing mein itni der atka job wapas queue mein
+STUCK_SECONDS = 600       # printing mein atka job error hoga; duplicate print se bachao
+WAITING_SECONDS = 3600    # 1 ghante se zyada pending job expire hogi
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
@@ -189,9 +190,37 @@ def maintenance():
         if now - S["maint"] < 60:
             return
         S["maint"] = now
-    run("UPDATE jobs SET status='waiting' WHERE status='printing' AND claimed<?", (now - STUCK_SECONDS,), write=True)
-    for r in run("SELECT DISTINCT printer_id FROM jobs WHERE status='waiting'"):
-        WAITING.add(r["printer_id"])
+    # Expire abandoned waiting jobs and remove their temporary files.
+    expired = run("SELECT id,path FROM jobs WHERE status='waiting' AND created<?", (now - WAITING_SECONDS,))
+    run("UPDATE jobs SET status='error', error=?, finished=? WHERE status='waiting' AND created<?",
+        ("Queue job expired after waiting too long. Please send again.", now, now - WAITING_SECONDS), write=True)
+    for job in expired:
+        if job["path"] and os.path.exists(job["path"]):
+            try: os.remove(job["path"])
+            except OSError: pass
+    # A printing job may already have reached the physical printer. Never auto-requeue it:
+    # doing so can print the same document twice. Mark stale jobs as error instead.
+    stale = run("SELECT id,path,printer_id FROM jobs WHERE status='printing' AND claimed<?", (now - STUCK_SECONDS,))
+    for job in stale:
+        run("UPDATE jobs SET status='error', error=?, finished=? WHERE id=? AND status='printing'",
+            ("Print agent stopped responding. Check the printer before sending again.", now, job["id"]), write=True)
+        if job["path"] and os.path.exists(job["path"]):
+            try: os.remove(job["path"])
+            except OSError: pass
+    # Jobs claimed by an agent whose heartbeat has gone stale are not safe to retry.
+    for job in run("SELECT id,path,printer_id FROM jobs WHERE status='printing'"):
+        printer = PRINTERS.get(job["printer_id"])
+        if not printer or now - printer.get("last_seen", 0) >= ONLINE_SECONDS:
+            run("UPDATE jobs SET status='error', error=?, finished=? WHERE id=? AND status='printing'",
+                ("The printer PC went offline. Please send again after checking the printer.", now, job["id"]), write=True)
+            if job["path"] and os.path.exists(job["path"]):
+                try: os.remove(job["path"])
+                except OSError: pass
+    waiting = {r["printer_id"] for r in run("SELECT DISTINCT printer_id FROM jobs WHERE status='waiting'")}
+    with state_lock:
+        WAITING.clear()
+        WAITING.update(waiting)
+    invalidate_queue()
 
 # ---------------- helpers ----------------
 fails = {}   # ip -> [timestamps]  (login brute-force se bachav)
@@ -1011,6 +1040,10 @@ ADMIN_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   <div class="tile"><b>{{ n_pages }}</b><span>Pages printed</span></div>
   <div class="tile"><b>{{ n_online }}/{{ printers|length }}</b><span>Printers online</span></div>
  </div>
+ <section class="card"><h2>Queue controls</h2>
+  <form method="post" action="/admin/clear-queue" onsubmit="return confirm('Clear all pending jobs?')"><button class="btn red">Clear all pending jobs</button></form>
+  <p class="hint">Only waiting jobs are cleared. Jobs already printing are not automatically retried or interrupted.</p>
+ </section>
  <div class="two">
   <section class="card"><h2>Add user / reset password</h2>
    <form class="addf" method="post" action="/admin/add">
@@ -1022,7 +1055,8 @@ ADMIN_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
   </section>
   <section class="card"><h2>Printers</h2>
    {% for p in printers %}<div class="job"><div class="jm"><div class="jn">{{ p.name }}</div><div class="js">{{ p.agent }}</div></div>
-    <span class="badge {{ 'ok' if p.online else 'bad' }}"><i class="dot"></i>{{ 'Online' if p.online else 'Offline' }}</span></div>
+    <span class="badge {{ 'ok' if p.online else 'bad' }}"><i class="dot"></i>{{ 'Online' if p.online else 'Offline' }}</span>
+    <form method="post" action="/admin/printer-remove" onsubmit="return confirm('Remove this printer?')"><input type="hidden" name="id" value="{{ p.id }}"><button class="btn red sm">Remove</button></form></div>
    {% else %}<div class="empty">No agent has connected yet.</div>{% endfor %}
   </section>
  </div>
@@ -1088,11 +1122,12 @@ def api_state():
     ps = sorted(PRINTERS.values(), key=lambda p: (p["name"].lower(), p["agent"]))
     printers = [{"id": p["id"], "name": p["name"], "agent": p["agent"],
                  "online": now - p["last_seen"] < ONLINE_SECONDS, "queue": q.get(p["id"], 0)} for p in ps]
-    rows = run("""SELECT j.filename, j.status, j.error, j.printer_id,
+    rows = run("""SELECT j.id, j.filename, j.pages, j.status, j.error, j.printer_id,
                   (SELECT COUNT(*) FROM jobs k WHERE k.printer_id=j.printer_id
                      AND k.status IN ('waiting','printing') AND k.created<j.created) AS ahead
                   FROM jobs j WHERE j.owner=? ORDER BY j.created DESC LIMIT 8""", (u["username"],))
-    jobs = [{"file": r["filename"], "printer": (PRINTERS.get(r["printer_id"]) or {}).get("name", "?"),
+    jobs = [{"id": r["id"], "file": r["filename"], "pages": int(r["pages"] or 0),
+             "printer": (PRINTERS.get(r["printer_id"]) or {}).get("name", "?"),
              "status": r["status"], "error": r["error"], "ahead": int(r["ahead"])} for r in rows]
     return jsonify({"printers": printers, "jobs": jobs})
 
@@ -1261,7 +1296,7 @@ def admin():
                    (SELECT COALESCE(SUM(j.pages*j.copies),0) FROM jobs j WHERE j.owner=u.username AND j.status='done') AS pages
                    FROM users u ORDER BY u.username""")
     now = time.time()
-    printers = [{"name": p["name"], "agent": p["agent"], "online": now - p["last_seen"] < ONLINE_SECONDS}
+    printers = [{"id": p["id"], "name": p["name"], "agent": p["agent"], "online": now - p["last_seen"] < ONLINE_SECONDS}
                 for p in sorted(PRINTERS.values(), key=lambda p: (p["name"].lower(), p["agent"]))]
     recent = run("SELECT owner,filename,status FROM jobs ORDER BY created DESC LIMIT 20")
     return render_template_string(
@@ -1292,6 +1327,64 @@ def admin_delete(username):
     _ucache.clear()
     return redirect("/admin?m=User deleted.")
 
+@app.route("/api/cancel/<jid>", methods=["POST"])
+def api_cancel(jid):
+    u = current_user()
+    if not u:
+        return jsonify({"error": "Please log in."}), 401
+    job = run("SELECT id,owner,status,path FROM jobs WHERE id=?", (jid,), one=True)
+    if not job or (job["owner"] != u["username"] and not u["is_admin"]):
+        return jsonify({"error": "Job not found."}), 404
+    if job["status"] != "waiting":
+        return jsonify({"error": "Only waiting jobs can be cancelled; a printing job may already be at the printer."}), 409
+    run("UPDATE jobs SET status='error', error=?, finished=? WHERE id=? AND status='waiting'",
+        ("Cancelled by you", time.time(), jid), write=True)
+    if job["path"] and os.path.exists(job["path"]):
+        try: os.remove(job["path"])
+        except OSError: pass
+    invalidate_queue()
+    return jsonify({"ok": True})
+
+@app.route("/admin/clear-queue", methods=["POST"])
+def admin_clear_queue():
+    if not admin_required():
+        abort(403)
+    rows = run("SELECT id,path FROM jobs WHERE status='waiting'")
+    now = time.time()
+    run("UPDATE jobs SET status='error', error=?, finished=? WHERE status='waiting'",
+        ("Cancelled by admin: queue cleared", now), write=True)
+    for row in rows:
+        if row["path"] and os.path.exists(row["path"]):
+            try: os.remove(row["path"])
+            except OSError: pass
+    with state_lock:
+        WAITING.clear()
+    invalidate_queue()
+    return redirect("/admin?m=Cleared " + str(len(rows)) + " pending job(s).")
+
+@app.route("/admin/printer-remove", methods=["POST"])
+def admin_printer_remove():
+    if not admin_required():
+        abort(403)
+    pid = request.form.get("id", "")
+    if not pid:
+        return redirect("/admin?m=Printer ID missing.")
+    # Fail active queued jobs rather than leaving them orphaned after removal.
+    rows = run("SELECT id,path FROM jobs WHERE printer_id=? AND status='waiting'", (pid,))
+    now = time.time()
+    run("UPDATE jobs SET status='error', error=?, finished=? WHERE printer_id=? AND status='waiting'",
+        ("Printer removed by admin", now, pid), write=True)
+    run("DELETE FROM printers WHERE id=?", (pid,), write=True)
+    for row in rows:
+        if row["path"] and os.path.exists(row["path"]):
+            try: os.remove(row["path"])
+            except OSError: pass
+    PRINTERS.pop(pid, None)
+    with state_lock:
+        WAITING.discard(pid)
+    invalidate_queue()
+    return redirect("/admin?m=Printer removed.")
+
 # ---------------- agent API (office PC) ----------------
 @app.route("/agent/heartbeat", methods=["POST"])
 def agent_heartbeat():
@@ -1300,6 +1393,15 @@ def agent_heartbeat():
     d = request.get_json(force=True)
     agent = str(d.get("agent", "PC"))[:40]
     now = time.time()
+    if d.get("boot"):
+        active = run("SELECT id,path FROM jobs WHERE status='printing' AND printer_id LIKE ?", (agent + "|%",))
+        run("UPDATE jobs SET status='error', error=?, finished=? WHERE status='printing' AND printer_id LIKE ?",
+            ("The print agent restarted. Please check the printer and send again if needed.", now, agent + "|%"), write=True)
+        for job in active:
+            if job["path"] and os.path.exists(job["path"]):
+                try: os.remove(job["path"])
+                except OSError: pass
+        invalidate_queue()
     for name in d.get("printers", []):
         pid = f"{agent}|{name}"
         p = PRINTERS.get(pid)
@@ -1342,7 +1444,7 @@ def agent_claim():
             cur.execute("""UPDATE jobs SET status='printing', claimed=%s
                            WHERE id=(SELECT id FROM jobs WHERE printer_id=%s AND status='waiting'
                                      ORDER BY created LIMIT 1 FOR UPDATE SKIP LOCKED)
-                           RETURNING id, copies, color, settings, path""", (now, pid))
+                           RETURNING id, pages, copies, color, settings, path""", (now, pid))
             job = cur.fetchone()
             c.commit()
         else:
@@ -1367,7 +1469,8 @@ def agent_claim():
         run("UPDATE jobs SET status='error', error=?, finished=? WHERE id=?",
             ("File server restart mein hat gayi, dobara bhejo", time.time(), job["id"]), write=True)
         return jsonify({"job": None})
-    return jsonify({"job": {"id": job["id"], "copies": job["copies"], "color": bool(job["color"]),
+    return jsonify({"job": {"id": job["id"], "pages": int(job["pages"] or 0),
+                            "copies": job["copies"], "color": bool(job["color"]),
                             "settings": job["settings"]}})
 
 @app.route("/agent/file/<jid>")

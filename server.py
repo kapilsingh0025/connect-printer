@@ -128,6 +128,12 @@ def init():
     ts = "DOUBLE PRECISION"
     run(f"CREATE TABLE IF NOT EXISTS users(username TEXT PRIMARY KEY, pw TEXT, is_admin INTEGER DEFAULT 0, created {ts})", write=True)
     run(f"CREATE TABLE IF NOT EXISTS printers(id TEXT PRIMARY KEY, label TEXT, last_seen {ts})", write=True)
+    run("CREATE TABLE IF NOT EXISTS user_printers(username TEXT, printer_id TEXT, PRIMARY KEY(username, printer_id))", write=True)
+    # all_printers: 1 = user har printer use kar sakta hai, 0 = sirf user_printers table wale (purane users 1 rahenge)
+    if USE_PG:
+        run("ALTER TABLE users ADD COLUMN IF NOT EXISTS all_printers INTEGER DEFAULT 1", write=True)
+    elif "all_printers" not in [r["name"] for r in run("PRAGMA table_info(users)")]:
+        run("ALTER TABLE users ADD COLUMN all_printers INTEGER DEFAULT 1", write=True)
     run(f"""CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, owner TEXT, filename TEXT, printer_id TEXT,
             copies INTEGER, color INTEGER, pages INTEGER, status TEXT, error TEXT,
             created {ts}, claimed {ts}, finished {ts}, path TEXT, settings TEXT)""", write=True)
@@ -242,6 +248,32 @@ def current_user():
     else:
         _ucache.pop(u, None)
     return row
+
+_acache = {}             # username -> (allowed set ya None, expiry)
+
+def allowed_printers(u):
+    """None = sab printers allowed (admin ya 'all printers' wale user). Warna allowed printer ids ka set."""
+    if u["is_admin"] or u["all_printers"] is None or int(u["all_printers"]) == 1:
+        return None
+    name = u["username"]
+    hit = _acache.get(name)
+    now = time.time()
+    if hit and hit[1] > now:
+        return hit[0]
+    ids = {r["printer_id"] for r in run("SELECT printer_id FROM user_printers WHERE username=?", (name,))}
+    _acache[name] = (ids, now + 30)
+    return ids
+
+def set_user_printers(username, all_flag, ids):
+    run("UPDATE users SET all_printers=? WHERE username=? AND is_admin=0", (1 if all_flag else 0, username), write=True)
+    run("DELETE FROM user_printers WHERE username=?", (username,), write=True)
+    if not all_flag:
+        for pid in set(ids):
+            if pid in PRINTERS:
+                run("INSERT INTO user_printers(username,printer_id) VALUES(?,?) ON CONFLICT DO NOTHING",
+                    (username, pid), write=True)
+    _ucache.clear()
+    _acache.clear()
 
 def agent_ok():
     return hmac.compare_digest(request.headers.get("X-Agent-Key", ""), AGENT_KEY)
@@ -954,7 +986,7 @@ function renderPrinters(){
   const box=$("ptiles"); box.innerHTML="";
   if(!printers.length){
     const d=document.createElement("div"); d.className="empty";
-    d.textContent="No printer found yet. Make sure the print agent is running on the office PC.";
+    d.textContent="No printer available for you. Ask the admin to give you printer access (or check that the print agent is running).";
     box.appendChild(d); return;
   }
   if(!printers.some(p=>p.id==selPrinter)){const f=printers.find(p=>p.online)||printers[0]; selPrinter=f.id}
@@ -1030,7 +1062,11 @@ async function send(){
 </body></html>"""
 
 ADMIN_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#1d4ed8"><title>Admin · Office Print</title>""" + APP_CSS + r"""</head><body>""" + HEADER_HTML + r"""
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#1d4ed8"><title>Admin · Office Print</title>""" + APP_CSS + r"""<style>
+.pbox{grid-column:1/-1;display:flex;flex-direction:column;gap:8px;padding:12px;border:1.5px solid var(--line);border-radius:10px;background:#f8fafc;font-size:14px}
+.pck{display:flex;align-items:center;gap:8px;cursor:pointer}.pck.sub{padding-left:22px}.pck input{width:18px;height:18px;flex:none}
+.pck small{color:var(--mut)}.pacc{margin:0 0 6px 48px;font-size:13px}.pacc summary{cursor:pointer;color:var(--mut);padding:4px 0}.pacc .pbox{margin-top:6px}
+</style></head><body>""" + HEADER_HTML + r"""
 <main class="wrap">
  {% if flash %}<div class="msg ok" style="display:block">{{ flash }}</div>{% endif %}
  <div class="note {{ 'ok' if permanent else 'warn' }}">{{ '✅ Permanent database: users and history are safe.' if permanent else '⚠️ Temporary storage: users can disappear when Render restarts. Set DATABASE_URL.' }}</div>
@@ -1050,8 +1086,14 @@ ADMIN_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
     <input name="u" placeholder="Username" autocapitalize="none" autocomplete="off" required>
     <input name="p" placeholder="Password (min 4 chars)" autocomplete="off" required>
     <button class="btn pri">Save</button>
+    <div class="pbox">
+     <b>Printer access</b>
+     <label class="pck"><input type="checkbox" name="all" value="1" checked onchange="pAll(this)"> All printers (including future ones)</label>
+     {% for p in printers %}<label class="pck sub"><input type="checkbox" name="pr" value="{{ p.id }}" disabled> {{ p.name }} <small>({{ p.agent }})</small></label>
+     {% else %}<div class="hint">No printer connected yet.</div>{% endfor %}
+    </div>
    </form>
-   <p class="hint">Type an existing username to change that user's password.</p>
+   <p class="hint">Type an existing username to change that user's password only. To change printer access later, use the "Printers" button in the Users list.</p>
   </section>
   <section class="card"><h2>Printers</h2>
    {% for p in printers %}<div class="job"><div class="jm"><div class="jn">{{ p.name }}</div><div class="js">{{ p.agent }}</div></div>
@@ -1065,7 +1107,15 @@ ADMIN_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
    <div class="jm"><div class="jn">{{ u.username }} {% if u.is_admin %}<span class="badge blue">Admin</span>{% endif %}</div>
     <div class="js">{{ u.jobs }} jobs · {{ u.pages }} pages</div></div>
    {% if not u.is_admin %}<form method="post" action="/admin/delete/{{ u.username }}" data-u="{{ u.username }}" onsubmit="return askDel(this)"><button class="btn red sm">Delete</button></form>{% endif %}
-  </div>{% endfor %}
+  </div>
+  {% if not u.is_admin %}<details class="pacc"><summary>Printers: {{ 'All' if u.all_printers else (u.granted|length ~ ' selected') }}</summary>
+   <form method="post" action="/admin/user-printers/{{ u.username }}" class="pbox">
+    <label class="pck"><input type="checkbox" name="all" value="1" {{ 'checked' if u.all_printers }} onchange="pAll(this)"> All printers (including future ones)</label>
+    {% for p in printers %}<label class="pck sub"><input type="checkbox" name="pr" value="{{ p.id }}" {{ 'checked' if p.id in u.granted }} {{ 'disabled' if u.all_printers }}> {{ p.name }} <small>({{ p.agent }})</small></label>
+    {% else %}<div class="hint">No printer connected yet.</div>{% endfor %}
+    <button class="btn pri sm">Save access</button>
+   </form></details>{% endif %}
+  {% endfor %}
  </section>
  <section class="card"><h2>Recent jobs</h2>
   {% for j in recent %}<div class="job"><div class="jm"><div class="jn">{{ j.filename }}</div><div class="js">{{ j.owner }}</div></div>
@@ -1074,6 +1124,7 @@ ADMIN_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
  </section>
 </main>""" + MODAL_HTML + r"""
 <script>
+function pAll(cb){cb.closest("form").querySelectorAll('input[name="pr"]').forEach(function(x){x.disabled=cb.checked})}
 function askDel(f){confirmBox("Delete user?","\""+f.dataset.u+"\" will no longer be able to sign in.","Delete",function(){f.submit()});return false}
 </script></body></html>"""
 
@@ -1119,7 +1170,10 @@ def api_state():
         return jsonify({"error": "login"}), 401
     q = queue_counts()
     now = time.time()
+    allowed = allowed_printers(u)
     ps = sorted(PRINTERS.values(), key=lambda p: (p["name"].lower(), p["agent"]))
+    if allowed is not None:
+        ps = [p for p in ps if p["id"] in allowed]
     printers = [{"id": p["id"], "name": p["name"], "agent": p["agent"],
                  "online": now - p["last_seen"] < ONLINE_SECONDS, "queue": q.get(p["id"], 0)} for p in ps]
     rows = run("""SELECT j.id, j.filename, j.pages, j.status, j.error, j.printer_id,
@@ -1205,6 +1259,9 @@ def _do_print(u):
     printer = PRINTERS.get(pid)
     if not f or not printer:
         return jsonify({"error": "File ya printer sahi nahi hai."}), 400
+    allowed = allowed_printers(u)
+    if allowed is not None and pid not in allowed:
+        return jsonify({"error": "Aapko is printer par print karne ki permission nahi hai."}), 403
     ext = os.path.splitext(f.filename or "")[1].lower()
     if ext not in ALLOWED:
         return jsonify({"error": "Sirf PDF, JPG, PNG chalega."}), 400
@@ -1291,7 +1348,7 @@ def admin():
     u = admin_required()
     if not u:
         return redirect("/login")
-    users = run("""SELECT u.username, u.is_admin,
+    users = run("""SELECT u.username, u.is_admin, u.all_printers,
                    (SELECT COUNT(*) FROM jobs j WHERE j.owner=u.username AND j.status='done') AS jobs,
                    (SELECT COALESCE(SUM(j.pages*j.copies),0) FROM jobs j WHERE j.owner=u.username AND j.status='done') AS pages
                    FROM users u ORDER BY u.username""")
@@ -1299,6 +1356,12 @@ def admin():
     printers = [{"id": p["id"], "name": p["name"], "agent": p["agent"], "online": now - p["last_seen"] < ONLINE_SECONDS}
                 for p in sorted(PRINTERS.values(), key=lambda p: (p["name"].lower(), p["agent"]))]
     recent = run("SELECT owner,filename,status FROM jobs ORDER BY created DESC LIMIT 20")
+    grants = {}
+    for r in run("SELECT username,printer_id FROM user_printers"):
+        grants.setdefault(r["username"], set()).add(r["printer_id"])
+    users = [{"username": x["username"], "is_admin": x["is_admin"], "jobs": x["jobs"], "pages": x["pages"],
+              "all_printers": x["all_printers"] is None or int(x["all_printers"]) == 1,
+              "granted": grants.get(x["username"], set())} for x in users]
     return render_template_string(
         ADMIN_HTML, users=users, printers=printers, recent=recent, permanent=USE_PG,
         flash=request.args.get("m"), user=u["username"], admin=True, page="admin",
@@ -1313,18 +1376,37 @@ def admin_add():
     p = request.form["p"]
     if not u or len(p) < 4 or u == ADMIN_USER:
         return redirect("/admin?m=Invalid username or password (minimum 4 characters).")
-    run("""INSERT INTO users(username,pw,is_admin,created) VALUES(?,?,0,?)
-           ON CONFLICT(username) DO UPDATE SET pw=excluded.pw WHERE users.is_admin=0""",
-        (u, hash_pw(p), time.time()), write=True)
-    _ucache.clear()
+    exists = run("SELECT username,is_admin FROM users WHERE username=?", (u,), one=True)
+    if exists:
+        # Purana user: sirf password badlo. Printer access niche user list ke "Printers" button se badlta hai.
+        run("UPDATE users SET pw=? WHERE username=? AND is_admin=0", (hash_pw(p), u), write=True)
+        _ucache.clear()
+        return redirect("/admin?m=Password updated: " + u)
+    all_flag = request.form.get("all") == "1"
+    run("INSERT INTO users(username,pw,is_admin,created,all_printers) VALUES(?,?,0,?,?)",
+        (u, hash_pw(p), time.time(), 1 if all_flag else 0), write=True)
+    set_user_printers(u, all_flag, request.form.getlist("pr"))
     return redirect("/admin?m=Saved: " + u)
+
+@app.route("/admin/user-printers/<username>", methods=["POST"])
+def admin_user_printers(username):
+    if not admin_required():
+        abort(403)
+    username = username.lower()
+    row = run("SELECT username,is_admin FROM users WHERE username=?", (username,), one=True)
+    if not row or row["is_admin"]:
+        return redirect("/admin?m=User not found.")
+    set_user_printers(username, request.form.get("all") == "1", request.form.getlist("pr"))
+    return redirect("/admin?m=Printer access updated: " + username)
 
 @app.route("/admin/delete/<username>", methods=["POST"])
 def admin_delete(username):
     if not admin_required():
         abort(403)
     run("DELETE FROM users WHERE username=? AND is_admin=0", (username.lower(),), write=True)
+    run("DELETE FROM user_printers WHERE username=?", (username.lower(),), write=True)
     _ucache.clear()
+    _acache.clear()
     return redirect("/admin?m=User deleted.")
 
 @app.route("/api/cancel/<jid>", methods=["POST"])
@@ -1375,6 +1457,8 @@ def admin_printer_remove():
     run("UPDATE jobs SET status='error', error=?, finished=? WHERE printer_id=? AND status='waiting'",
         ("Printer removed by admin", now, pid), write=True)
     run("DELETE FROM printers WHERE id=?", (pid,), write=True)
+    run("DELETE FROM user_printers WHERE printer_id=?", (pid,), write=True)
+    _acache.clear()
     for row in rows:
         if row["path"] and os.path.exists(row["path"]):
             try: os.remove(row["path"])

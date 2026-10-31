@@ -722,7 +722,7 @@ const PAPER={A3:[842,1191],A4:[595,842],A5:[420,595],letter:[612,792],legal:[612
 const GRID={2:[1,2],4:[2,2],6:[2,3],9:[3,3]};
 let pdfDoc=null,imgURL=null,imgDim=null,nPages=0,cur=0,renderTok=0,workFile=null;
 const CONVERT=new Set(["doc","docx","odt","rtf","txt","xls","xlsx","ods","csv","ppt","pptx","odp","tif","tiff"]);
-const sizeCache={},srcCache={};
+const sizeCache={},srcCache={},srcOrder=[];
 
 function show(t,c){const m=$("msg");m.className="msg "+(c||"");m.textContent=t;m.style.display="block";window.scrollTo(0,0)}
 
@@ -795,16 +795,20 @@ async function getSize(p){
   sizeCache[p]=z; return z;
 }
 
-async function getSrc(p){
-  if(srcCache[p]) return srcCache[p];
-  let u;
-  if(pdfDoc){
-    const pg=await pdfDoc.getPage(p), v0=pg.getViewport({scale:1}), v=pg.getViewport({scale:700/v0.width});
-    const cv=document.createElement("canvas"); cv.width=v.width; cv.height=v.height;
-    await pg.render({canvasContext:cv.getContext("2d"),viewport:v}).promise;
-    u=cv.toDataURL("image/jpeg",0.85);
-  }else u=imgURL;
-  srcCache[p]=u; return u;
+async function getSrc(p,wpx){
+  if(!pdfDoc) return imgURL;
+  /* Page ko theek utne device pixels par render karo jitne screen par dikhne hain.
+     Phir browser ko image chhoti/badi nahi karni padti, isliye 2/4/6/9 pages per sheet mein bhi text saaf rehta hai. */
+  const bw=Math.min(2400,Math.max(120,Math.round(wpx||700))), key=p+"_"+bw;
+  if(srcCache[key]) return srcCache[key];
+  const pg=await pdfDoc.getPage(p), v0=pg.getViewport({scale:1}), v=pg.getViewport({scale:bw/v0.width});
+  const cv=document.createElement("canvas"); cv.width=bw; cv.height=Math.max(1,Math.round(v.height));
+  await pg.render({canvasContext:cv.getContext("2d"),viewport:v}).promise;
+  const u=cv.toDataURL("image/jpeg",0.95);
+  cv.width=cv.height=0;
+  srcCache[key]=u; srcOrder.push(key);
+  while(srcOrder.length>14) delete srcCache[srcOrder.shift()];   // phone ki memory na bhare
+  return u;
 }
 
 function updateSummary(count,total){
@@ -830,17 +834,21 @@ async function showSheet(){
   updateSummary(sel.list.length,total);
   const chunk=sel.list.slice(cur*nup,cur*nup+nup);
   try{
-    const sizes=await Promise.all(chunk.map(getSize)), first=await getSize(sel.list[0]), srcs=await Promise.all(chunk.map(getSrc));
+    const sizes=await Promise.all(chunk.map(getSize)), first=await getSize(sel.list[0]);
     if(tok!=renderTok) return;
     const L=computeSheet({nup:nup,orient:$("orient").value,scale:$("scale").value,paper:$("paper").value,pct:Math.max(10,Math.min(400,parseInt($("pct").value)||100))},sizes,first);
     const avail=Math.max(180,Math.min($("sheetwrap").clientWidth-8,460));
     const k=Math.min(avail/L.sw,520/L.sh);
+    const dpr=Math.max(1,Math.min(3,window.devicePixelRatio||1));
+    const srcs=await Promise.all(L.items.map(it=>getSrc(chunk[it.i],Math.round(it.w*k*dpr))));
+    if(tok!=renderTok) return;
     box.style.display="block"; box.style.width=(L.sw*k)+"px"; box.style.height=(L.sh*k)+"px"; box.innerHTML="";
     const gray=$("color").value=="0";
     L.items.forEach(it=>{
       const im=new Image(); im.src=srcs[it.i];
-      const w=it.w*k, h=it.h*k;
-      im.style.cssText="position:absolute;width:"+w+"px;height:"+h+"px;left:"+(it.cx*k-w/2)+"px;top:"+(it.cy*k-h/2)+"px;"+(it.rot?"transform:rotate(90deg);":"")+(gray?"filter:grayscale(1);":"");
+      const pw=Math.round(it.w*k*dpr), ph=Math.round(pw*it.h/it.w), w=pw/dpr, h=ph/dpr;   // device pixel par snap = 1:1, no blur
+      const lx=Math.round((it.cx*k-w/2)*dpr)/dpr, ty=Math.round((it.cy*k-h/2)*dpr)/dpr;
+      im.style.cssText="position:absolute;width:"+w+"px;height:"+h+"px;left:"+lx+"px;top:"+ty+"px;"+(it.rot?"transform:rotate(90deg);":"")+(gray?"filter:grayscale(1);":"");
       box.appendChild(im);
     });
     $("navtxt").textContent="Sheet "+(cur+1)+" of "+total;
@@ -863,6 +871,7 @@ function resetPreview(){
   if(imgURL){URL.revokeObjectURL(imgURL);imgURL=null}
   for(const k in sizeCache) delete sizeCache[k];
   for(const k in srcCache) delete srcCache[k];
+  srcOrder.length=0;
   nPages=0; cur=0; $("sheet").innerHTML="";
 }
 function fmtSize(n){return n>1048576?(n/1048576).toFixed(1)+" MB":Math.max(1,Math.round(n/1024))+" KB"}

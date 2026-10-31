@@ -338,27 +338,30 @@ def process_pdf(src, dst, sel, orient, nup, paper, scale="shrink", pct=100):
     w = PdfWriter()
     pw0, ph0 = PAPER_PT[paper]
     if nup == 1:
+        # Content KABHI rotate nahi hota. Paper-size ki sheet portrait/landscape banti hai aur page
+        # uspar scale + center hota hai -- bilkul preview jaisa. Printer ko size/offset guess nahi karna padta.
+        land_flags = []
         for p in pages:
             ww, hh = size(p)
-            rotated = False
-            if orient != "auto" and (ww > hh) != (orient == "landscape"):
-                p.rotate(90)
-                rotated = True
+            land = (ww > hh) if orient == "auto" else (orient == "landscape")
+            land_flags.append(land)
+            sw, sh = (ph0, pw0) if land else (pw0, ph0)
+            fit_s = min(sw / ww, sh / hh)
             if scale == "custom":
-                if rotated:
-                    p.transfer_rotation_to_content()
-                ww, hh = size(p)
-                land = (ww > hh) if orient == "auto" else (orient == "landscape")
-                sw, sh = (ph0, pw0) if land else (pw0, ph0)
                 f = pct / 100.0
-                sheet = PageObject.create_blank_page(width=sw, height=sh)
-                tr = (Transformation().translate(-float(p.mediabox.left), -float(p.mediabox.bottom))
-                      .scale(f, f).translate((sw - ww * f) / 2, (sh - hh * f) / 2))
-                sheet.merge_transformed_page(p, tr)
-                w.add_page(sheet)
-            else:
-                w.add_page(p)
-        token = orient if orient != "auto" else None
+            elif scale == "noscale":
+                f = 1.0
+            elif scale == "fit":
+                f = fit_s
+            else:                                   # shrink
+                f = min(1.0, fit_s)
+            sheet = PageObject.create_blank_page(width=sw, height=sh)
+            tr = (Transformation().translate(-float(p.mediabox.left), -float(p.mediabox.bottom))
+                  .scale(f, f).translate((sw - ww * f) / 2, (sh - hh * f) / 2))
+            sheet.merge_transformed_page(p, tr)
+            w.add_page(sheet)
+        lands = set(land_flags)
+        token = ("landscape" if True in lands else "portrait") if len(lands) == 1 else None
     else:
         fw, fh = size(pages[0])
         first_land = fw > fh
@@ -493,6 +496,8 @@ button.go:hover{filter:brightness(1.06)}
 button.go:active{transform:translateY(1px)}
 button.go[disabled]{opacity:.7;cursor:wait}
 .note{margin-top:22px;text-align:center;font-size:13px;color:var(--mut)}
+.dlapp{margin-top:14px;width:100%;max-width:400px;height:48px;display:flex;align-items:center;justify-content:center;gap:8px;border-radius:12px;background:#fff;color:var(--blue);border:1.5px solid #bfdbfe;font-size:15px;font-weight:600;text-decoration:none;box-shadow:0 2px 8px rgba(15,23,42,.06);transition:.15s;font-family:inherit}
+.dlapp:hover{background:#eff6ff;border-color:var(--blue)}
 @media(max-width:860px){
   body{background:linear-gradient(160deg,#1e3a8a,#2563eb 60%,#38bdf8) fixed}
   .shell{grid-template-columns:1fr}.hero{display:none}
@@ -529,6 +534,7 @@ button.go[disabled]{opacity:.7;cursor:wait}
    <button class="go" id="go">Sign in</button>
    <div class="note">Trouble signing in? Ask your office admin.</div>
   </form>
+  <a class="dlapp" href="/download/app" download="OfficePrint.apk"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Download Android App</a>
  </main>
 </div>
 <script>
@@ -761,8 +767,8 @@ function computeSheet(o,sizes,first){
     const z=sizes[0], pl=z.w>z.h;
     const land=o.orient=="auto"?pl:o.orient=="landscape";
     const sw=land?P[1]:P[0], sh=land?P[0]:P[1];
-    const rot=pl!=land, cw=rot?z.h:z.w, ch=rot?z.w:z.h;
-    const fitS=Math.min(sw/cw,sh/ch);
+    const rot=false;   // content kabhi rotate nahi hota, sirf sheet badalti hai
+    const fitS=Math.min(sw/z.w,sh/z.h);
     const s=o.scale=="custom"?(o.pct/100):(o.scale=="noscale"?1:(o.scale=="fit"?fitS:Math.min(1,fitS)));
     return {sw:sw,sh:sh,items:[{i:0,rot:rot,w:z.w*s,h:z.h*s,cx:sw/2,cy:sh/2}]};
   }
@@ -1265,26 +1271,33 @@ def _do_print(u):
     ext = os.path.splitext(f.filename or "")[1].lower()
     if ext not in ALLOWED:
         return jsonify({"error": "Sirf PDF, JPG, PNG chalega."}), 400
-    try:
-        copies = max(1, min(50, int(request.form.get("copies", 1))))
-        nup = int(request.form.get("nup", 1))
-    except ValueError:
-        return jsonify({"error": "Print settings sahi nahi hain."}), 400
+    # "Zero error" rule: print settings kabhi reject nahi hote -- galat/khali value par safe default lagta hai.
+    def _int(v, d):
+        try:
+            return int(float(str(v).strip()))
+        except (TypeError, ValueError):
+            return d
+    copies = max(1, min(50, _int(request.form.get("copies"), 1)))
+    nup = _int(request.form.get("nup"), 1)
+    if nup not in NUP_GRID:
+        nup = 1
     color = request.form.get("color") == "1"
     paper = request.form.get("paper", "A4")
+    if paper not in PAPERS:
+        paper = "A4"
     orient = request.form.get("orient", "auto")
+    if orient not in ORIENTS:
+        orient = "auto"
     scale = request.form.get("scale", "shrink")
+    if scale not in SCALES:
+        scale = "shrink"
     sides = request.form.get("sides", "single")
+    if sides not in SIDES:
+        sides = "single"
     mode = request.form.get("mode", "all")
-    try:
-        pct = int(request.form.get("scale_pct", 100))
-    except ValueError:
-        pct = 100
-    if scale == "custom" and nup == 1 and not (10 <= pct <= 400):
-        return jsonify({"error": "Custom scale 10% se 400% ke beech rakho."}), 400
-    if (paper not in PAPERS or orient not in ORIENTS or scale not in SCALES
-            or sides not in SIDES or nup not in (1, 2, 4, 6, 9)):
-        return jsonify({"error": "Print settings sahi nahi hain."}), 400
+    if mode not in ("all", "odd", "even", "custom"):
+        mode = "all"
+    pct = max(10, min(400, _int(request.form.get("scale_pct"), 100)))
 
     jid = uuid.uuid4().hex[:10]
     path = os.path.join(UPLOAD_DIR, jid + ext)
@@ -1319,7 +1332,7 @@ def _do_print(u):
             return jsonify({"error": NO_OFFICE_MSG}), 501
         return jsonify({"error": "File kharab hai ya khul nahi rahi."}), 400
 
-    eff_scale = "shrink" if nup > 1 else ("noscale" if scale == "custom" else scale)
+    eff_scale = "fit"      # sheet pehle se exact paper size par centered hai; Sumatra sirf printable area mein center karega
     settings = build_settings(copies, color, paper, token, eff_scale, sides)
     ahead = ahead_count(pid)
     run("""INSERT INTO jobs(id,owner,filename,printer_id,copies,color,pages,status,created,path,settings)
@@ -1578,6 +1591,14 @@ def agent_done(jid):
         os.remove(job["path"])          # privacy: print ke baad file hata do
     invalidate_queue()
     return jsonify({"ok": True})
+
+@app.route("/download/app")
+def download_app():
+    path = os.path.join(BASE, "OfficePrint.apk")
+    if not os.path.isfile(path):
+        abort(404)
+    return send_file(path, mimetype="application/vnd.android.package-archive",
+                     as_attachment=True, download_name="OfficePrint.apk")
 
 @app.route("/healthz")
 def healthz():

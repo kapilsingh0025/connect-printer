@@ -11,5 +11,6 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY server.py .
+COPY OfficePrint.apk .
 
 CMD gunicorn server:app --workers 1 --threads 16 --timeout 180 --bind 0.0.0.0:${PORT:-10000}

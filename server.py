@@ -323,10 +323,25 @@ def select_pages(mode, rng, n):
         raise ValueError
     return base
 
-def process_pdf(src, dst, sel, orient, nup, paper, scale="shrink", pct=100):
+class NeedPassword(Exception):
+    """PDF par password hai (args[0] = 'need' ya 'wrong')."""
+
+def open_pdf(path, password=""):
+    """PDF kholo. Password wali PDF ho to diya hua password lagao (khali password bhi try hota hai)."""
+    from pypdf import PdfReader
+    r = PdfReader(path)
+    if r.is_encrypted:
+        ok = r.decrypt(password) if password else 0
+        if not ok:
+            ok = r.decrypt("")
+        if not ok:
+            raise NeedPassword("wrong" if password else "need")
+    return r
+
+def process_pdf(src, dst, sel, orient, nup, paper, scale="shrink", pct=100, password=""):
     """Chune hue pages nikalo, orientation lagao, pages-per-sheet banao. Sumatra ke liye orientation token lautata hai."""
-    from pypdf import PdfReader, PdfWriter, PageObject, Transformation
-    r = PdfReader(src)
+    from pypdf import PdfWriter, PageObject, Transformation
+    r = open_pdf(src, password)
     pages = [r.pages[i - 1] for i in sel]
     for p in pages:
         try:
@@ -432,10 +447,11 @@ def to_pdf(src, dst, ext):
     else:
         image_to_pdf(src, dst)
 
-def count_pages(path):
+def count_pages(path, password=""):
     try:
-        from pypdf import PdfReader
-        return len(PdfReader(path).pages)
+        return len(open_pdf(path, password).pages)
+    except NeedPassword:
+        raise
     except Exception:
         return 1
 
@@ -602,6 +618,11 @@ body{margin:0;font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,Arial,
 .sheet{position:relative;background:#fff;box-shadow:0 2px 10px #0006;overflow:hidden;display:none}
 .nav{display:flex;justify-content:center;gap:14px;align-items:center;margin-top:12px;font-size:14px;font-weight:600}
 .pmsg{font-size:13px;color:#b45309;margin-top:8px;text-align:center}
+.pwbox{margin-top:10px;padding:14px;border-radius:12px;background:#fef9c3;border:1px solid #fde68a}
+.pwbox[hidden]{display:none}
+.pwt{font-weight:600;font-size:14px;margin-bottom:10px}
+.pwr{display:flex;gap:8px}.pwr input{flex:1;min-width:0;height:36px;padding:0 10px;font-size:15px;border:1px solid #cbd5e1;border-radius:10px;box-sizing:border-box}
+.pwe{color:#b91c1c;font-size:13px;margin-top:8px;min-height:1em}
 .row{display:grid;grid-template-columns:130px 1fr;gap:10px;align-items:center;padding:9px 0;border-top:1px solid #f1f5f9}
 .row:first-of-type{border-top:0}
 .row label{font-weight:600;font-size:14px;color:#334155}
@@ -692,6 +713,11 @@ MAIN_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
    <div class="sumtop" id="sumtop"></div><div class="subtop" id="subtop"></div>
    <div class="sheetwrap" id="sheetwrap"><div class="sheet" id="sheet"></div></div>
    <div class="nav"><button class="btn gray sm" id="prev" type="button">◀</button><span id="navtxt"></span><button class="btn gray sm" id="next" type="button">▶</button></div>
+   <div class="pwbox" id="pwbox" hidden>
+    <div class="pwt">🔒 This PDF is password protected</div>
+    <div class="pwr"><input type="password" id="pdfpw" placeholder="Enter PDF password" autocomplete="off" onkeydown="if(event.key==='Enter'){event.preventDefault();unlockPdf()}"><button class="btn pri sm" type="button" onclick="unlockPdf()">Unlock</button></div>
+    <div class="pwe" id="pwerr"></div>
+   </div>
    <div class="pmsg" id="pmsg"></div>
   </section>
   <section class="card">
@@ -867,6 +893,7 @@ $("next").onclick=()=>{cur++;showSheet()};
 let rt=null; window.addEventListener("resize",()=>{clearTimeout(rt);rt=setTimeout(showSheet,200)});
 
 function resetPreview(){
+  pdfBytes=null; pdfPass=""; $("pwbox").hidden=true; $("pwerr").textContent="";
   if(pdfDoc){pdfDoc.destroy();pdfDoc=null}
   if(imgURL){URL.revokeObjectURL(imgURL);imgURL=null}
   for(const k in sizeCache) delete sizeCache[k];
@@ -878,6 +905,32 @@ function fmtSize(n){return n>1048576?(n/1048576).toFixed(1)+" MB":Math.max(1,Mat
 function cancelFile(){
   $("file").value=""; workFile=null; resetPreview();
   $("dlg").hidden=true; $("drop").hidden=false; $("fileinfo").hidden=true;
+}
+
+let pdfBytes=null, pdfPass="";
+async function openPdf(pw){
+  try{
+    pdfDoc=await pdfjsLib.getDocument({data:new Uint8Array(pdfBytes.slice(0)),password:pw||undefined}).promise;
+    nPages=pdfDoc.numPages; return "ok";
+  }catch(e){
+    if(e&&e.name=="PasswordException") return e.code==2?"wrong":"need";
+    return "fail";
+  }
+}
+function showPw(msg){
+  nPages=0; pdfDoc=null; $("sheet").innerHTML=""; $("pmsg").textContent=""; $("sumtop").textContent=""; $("subtop").textContent=""; $("navtxt").textContent="";
+  $("pwbox").hidden=false; $("pwerr").textContent=msg||""; $("pdfpw").value=""; $("btn").disabled=true;
+  setTimeout(function(){$("pdfpw").focus()},50);
+}
+async function unlockPdf(){
+  const pw=$("pdfpw").value;
+  if(!pw){$("pwerr").textContent="Enter the password.";return}
+  if(!pdfBytes||!window.pdfjsLib){          // preview nahi bana sakte, server password check karega
+    pdfPass=pw; $("pwbox").hidden=true; $("btn").disabled=false; refresh(); return;
+  }
+  const r=await openPdf(pw);
+  if(r=="need"||r=="wrong"){$("pwerr").textContent="Wrong password. Try again.";$("pdfpw").value="";return}
+  pdfPass=pw; $("pwbox").hidden=true; $("pwerr").textContent=""; $("btn").disabled=false; cur=0; refresh();
 }
 
 let pdfjsP=null;
@@ -926,8 +979,10 @@ async function loadFile(){
   try{
     if(f.name.toLowerCase().endsWith(".pdf")||f.type=="application/pdf"){
       await loadPdfJs();
-      const buf=await f.arrayBuffer();
-      pdfDoc=await pdfjsLib.getDocument({data:buf}).promise; nPages=pdfDoc.numPages;
+      pdfBytes=await f.arrayBuffer();
+      const st=await openPdf("");
+      if(st=="need"||st=="wrong"){showPw(""); return}
+      if(st=="fail") nPages=0;
     }else{
       const img=new Image(); imgURL=URL.createObjectURL(f);
       await new Promise((ok,bad)=>{img.onload=ok;img.onerror=bad;img.src=imgURL});
@@ -1062,6 +1117,7 @@ async function send(){
   fd.append("sides",$("sides").value);
   fd.append("nup",$("nup").value); fd.append("mode",$("pmode").value);
   fd.append("range",$("pmode").value=="custom"?$("range").value:"");
+  if(pdfPass) fd.append("pdf_password",pdfPass);
   fd.append("req_id",Date.now().toString(36)+Math.random().toString(36).slice(2,10));  // retry par duplicate print na ho
   $("btn").disabled=true; $("btn").textContent="Uploading...";
   const r=await postRetry(function(){return xhrPost("/api/print",fd,{onProg:function(p){$("btn").textContent=p<100?"Uploading "+p+"%":"Sending to printer..."}})},function(t){show(t,"")});
@@ -1070,8 +1126,9 @@ async function send(){
   }else{
     show(errText(r),"err");
     if(r.status==401) setTimeout(function(){location.href="/login"},1500);
+    if(r.json&&r.json.need_password) showPw(r.json.error);
   }
-  $("btn").disabled=false; $("btn").textContent="Print"; poll();
+  $("btn").disabled=!$("pwbox").hidden; $("btn").textContent="Print"; poll();
 }
 </script>
 </body></html>"""
@@ -1308,7 +1365,9 @@ def _do_print(u):
         mode = "all"
     pct = max(10, min(400, _int(request.form.get("scale_pct"), 100)))
 
+    pdf_pw = (request.form.get("pdf_password") or "")[:200]      # sirf memory mein, kahin save/log nahi hota
     jid = uuid.uuid4().hex[:10]
+    t_begin = time.time()
     path = os.path.join(UPLOAD_DIR, jid + ext)
     f.save(path)
     junk = [path]
@@ -1318,7 +1377,7 @@ def _do_print(u):
             junk.append(pdf)
             to_pdf(path, pdf, ext)
             path = pdf
-        total = count_pages(path)
+        total = count_pages(path, pdf_pw)
         try:
             sel = select_pages(mode, request.form.get("range", ""), total)
         except ValueError:
@@ -1328,7 +1387,7 @@ def _do_print(u):
             return jsonify({"error": f"Koi page select nahi hua ya pages galat hain. File mein {total} page hain. Aise likho: 1-3,5"}), 400
         out = os.path.join(UPLOAD_DIR, jid + "_out.pdf")
         junk.append(out)
-        token = process_pdf(path, out, sel, orient, nup, paper, scale, pct)
+        token = process_pdf(path, out, sel, orient, nup, paper, scale, pct, pdf_pw)
         for j in junk[:-1]:
             if os.path.exists(j):
                 os.remove(j)
@@ -1337,10 +1396,16 @@ def _do_print(u):
         for j in junk:
             if os.path.exists(j):
                 os.remove(j)
+        if isinstance(e, NeedPassword):
+            msg = ("Password galat hai. Dobara try karo." if e.args and e.args[0] == "wrong"
+                   else "Ye PDF password se locked hai. Password daalo.")
+            return jsonify({"error": msg, "need_password": True}), 400
         if str(e) == "no_office":
             return jsonify({"error": NO_OFFICE_MSG}), 501
+        print(f"[print] {jid} open/process error: {type(e).__name__}: {str(e)[:150]}", flush=True)
         return jsonify({"error": "File kharab hai ya khul nahi rahi."}), 400
 
+    print(f"[print] {jid} server processing {time.time() - t_begin:.2f}s, {len(sel)} pages", flush=True)
     eff_scale = "fit"      # sheet pehle se exact paper size par centered hai; Sumatra sirf printable area mein center karega
     settings = build_settings(copies, color, paper, token, eff_scale, sides)
     ahead = ahead_count(pid)

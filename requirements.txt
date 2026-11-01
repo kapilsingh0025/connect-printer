@@ -2,4 +2,5 @@ flask
 gunicorn
 pillow
 pypdf
+cryptography
 psycopg2-binary
